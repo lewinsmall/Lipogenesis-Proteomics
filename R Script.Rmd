@@ -1,0 +1,935 @@
+---
+title: "Proteomics of Hepatic Lipogenesis from a Dietary Mouse Model"
+author: "Lewin Small"
+date: "2024-08-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Load packages
+
+Install packages either directly in R or individually from bioconductor then load as below
+
+```{r packages,message = FALSE}
+library(Rmisc)
+library(tidyverse)
+library(QFeatures)
+library(limma)
+library(patchwork)
+library(readxl)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(wesanderson)
+library(ggExtra)
+library(ggrepel)
+library(plotly)
+library(scales)
+library(ggVennDiagram)
+library(ggpubr)
+```
+
+Package Versions
+ 
+```{r versions}
+print(sessionInfo())
+```
+
+Colour scheme for plots
+
+```{r colour_scheme}
+diet_colors <- wes_palette("Moonrise3", 3, type = "discrete")
+```
+
+### Load Data
+
+Read in proteomics data and metadata
+
+```{r read_in_data}
+proteinGroups <- read.delim("/Users/lsma0320/Documents/GitHub/Lipogenesis-Proteomics/proteinGroups.txt")
+lipogenesis_metadata <- read_excel("/Users/lsma0320/Documents/GitHub/Lipogenesis-Proteomics/lipogenesis_metadata.xlsx",sheet = 3)
+```
+
+### Data Wrangling
+
+Subset data to filter out contaminants, reverse and only ID by site
+
+```{r filter_contam}
+sub1 <- subset(proteinGroups, Potential.contaminant =="")
+sub2 <- subset(sub1, Reverse =="")
+sub3 <- subset(sub2, Only.identified.by.site =="")
+```
+
+Subset data to retain proteins identified using 2 or more unique peptides
+
+```{r filter_2_or_more_peptides}
+FilterALL <- subset(sub3, Unique.peptides >= 2)
+```
+
+Select Protein IDs and LFQ intensities in proteinGroups data
+
+```{r wrangle_LFQ_data}
+LFQdata1 <- subset(FilterALL, select = c(1,7, 541:614))
+colnames(LFQdata1) <- sub(".*4WEEKS_","",colnames(LFQdata1))
+colnames(LFQdata1) <- sub(".*30WEEKS_","",colnames(LFQdata1))
+
+# Convert 0 values to NAs
+
+LFQdata1[LFQdata1 == 0] <- NA
+
+# Make a unique gene.names column
+
+LFQdata1 <- mutate(LFQdata1,unique.gene.name = sub(";.*", "",LFQdata1$Gene.names)) %>% relocate(unique.gene.name,.after =  Gene.names)
+```
+
+Wrangle metadata
+
+```{r wrangle_metadata}
+lipogenesis_metadata$Animal_ID <- as.character(lipogenesis_metadata$Animal_ID)
+lipogenesis_metadata$liver_lipogenesis <- as.numeric(lipogenesis_metadata$liver_lipogenesis)
+
+dim(lipogenesis_metadata)
+
+# Filter metadata for samples ran on mass spec. 
+lipogenesis_metadata <- filter(lipogenesis_metadata, Animal_ID %in% colnames(LFQdata1[,4:77]))  %>% mutate(sub_group = paste(Diet,time_on_diet,sep = "_"))
+
+dim(lipogenesis_metadata)
+```
+
+
+Transform dataframe to matrix
+
+```{r transform_matrix}
+mat <- as.matrix(column_to_rownames(remove_rownames(LFQdata1[,c(1,4:77)]),"Protein.IDs"))
+
+# subset matrix to be the same sample order as metadata
+
+mat <- mat[,lipogenesis_metadata$Animal_ID]
+identical(colnames(mat),lipogenesis_metadata$Animal_ID)
+```
+
+### Sample Quality Control
+
+Correlation between samples to identify samples with technical issues 
+
+```{r sample_qc}
+cor_matrix <- cor(na.omit(mat))
+
+heatmap(cor(na.omit(mat)))
+
+sample_cor <- data.frame(colMeans(cor_matrix))
+
+high_variable_samples <- filter(sample_cor,sample_cor$colMeans.cor_matrix.<0.9)
+
+print(high_variable_samples)
+
+barplot(colMeans(cor_matrix))
+```
+
+### Data Processing and normalisation
+
+Make a summarized experiment object
+
+```{r sum_exp_obj}
+protein_info <- column_to_rownames(remove_rownames(LFQdata1[,1:3]),"Protein.IDs")
+
+sumExp <- SummarizedExperiment(assays = mat, colData=column_to_rownames(remove_rownames(lipogenesis_metadata),"Animal_ID"), protein_info)
+
+nNA(sumExp)
+```
+
+Log transformation
+
+```{r log_transform}
+
+sumExp <- QFeatures::logTransform(sumExp)
+
+boxplot(assay(sumExp))
+```
+
+Normalisation, here I use "diff.median"
+
+```{r normalisation}
+sumExp <- QFeatures::normalize(sumExp,method="diff.median")
+
+boxplot(assay(sumExp))
+
+limma::plotDensities(assay(sumExp))
+```
+
+Filter out samples with low sample to sample CV
+
+```{r filter_by_CV}
+sumExp <- sumExp[,!(rownames(sumExp@colData) %in%  rownames(high_variable_samples))]
+
+cor_matrix_without_outliers <- cor(na.omit(assay(sumExp)))
+
+heatmap(cor_matrix_without_outliers)
+
+barplot(colMeans(cor_matrix_without_outliers))
+
+limma::plotDensities(assay(sumExp))
+```
+
+# Analysis of 4-week diet data
+
+Subset 4 week data
+
+```{r subset_4_week}
+four_week_data <- sumExp[,sumExp$time_on_diet == "four_weeks"]
+dim(four_week_data)
+```
+
+Filter proteins with high missing values and identify values missing at random (MAR) and values missing not at random by looking at the distribution of NAs between groups. 
+
+```{r determining_MNAR}
+missing_tidy_4_weeks <- as_tibble(assay(four_week_data), rownames = "proteins") %>% pivot_longer(cols=-"proteins",names_to = "Animal_ID",values_to = "LogIntensity") %>% inner_join(lipogenesis_metadata,by="Animal_ID")
+
+Missing_table_4_weeks <- missing_tidy_4_weeks %>% 
+  dplyr::group_by(Diet,proteins) %>% 
+  summarise(sum_not_na = sum(!is.na(LogIntensity))) %>% 
+  pivot_wider(names_from = Diet,values_from = sum_not_na) %>%
+  mutate(p_not_na_chow = chow/length(which(four_week_data@colData$Diet == "chow"))*100) %>% 
+  mutate(p_not_na_starch = starch/length(which(four_week_data@colData$Diet == "starch"))*100) %>% 
+  mutate(p_not_na_fat = fat/length(which(four_week_data@colData$Diet == "fat"))*100) %>% 
+  rowwise()  %>% 
+  mutate(largest_dif=max(abs(diff(c(p_not_na_chow,p_not_na_starch,p_not_na_fat)))))
+
+hist(Missing_table_4_weeks$largest_dif)
+
+# Filtering out proteins that were detected in less than 8 samples in each diet unless dtermined MNAR
+
+Missing_table_4_weeks <- mutate(Missing_table_4_weeks,MAR = if_else(largest_dif >= 60,FALSE,TRUE))%>% 
+  mutate(Keep=if_else(MAR==FALSE|(chow >= 8 & starch >= 8 & fat >= 8),"YES","NO"))
+
+table(Missing_table_4_weeks$Keep)
+
+protein_table_4_weeks <- full_join(rownames_to_column(protein_info,"proteins"),Missing_table_4_weeks,by = "proteins")
+
+filtered_sumExp_4_weeks <- SummarizedExperiment(assays= assay(four_week_data), colData=four_week_data@colData, rowData=protein_table_4_weeks)
+
+filtered_sumExp_4_weeks <- filtered_sumExp_4_weeks[filtered_sumExp_4_weeks@elementMetadata$Keep == "YES",]
+```
+
+Imputation, low values are imputed in for samples that are not MAR (MNAR) using a left-censored imputation (QRILC) so that proteins that have a pattern of MNAR can be statistically analysed
+(Only 7 proteins are MNAR)
+
+```{r imputation}
+imputed_sumExp_4_weeks <- QFeatures::impute(filtered_sumExp_4_weeks, method = "mixed",
+                                       randna = filtered_sumExp_4_weeks@elementMetadata$MAR,
+                                       mar = "none",
+                                       mnar = "QRILC")
+```
+
+MDS to visualize shape of data
+
+```{r MDS}
+mds_function <- function(dataset){
+  
+  mds <- plotMDS(assay(dataset), plot = FALSE,top=500)
+  
+  mds_df <- data.frame(Animal_ID = colnames(mds$distance.matrix.squared),X = mds$x, Y = mds$y,Dim1 = mds$eigen.vectors[,1], Dim2 = mds$eigen.vectors[,2], Dim3 = mds$eigen.vectors[,3],
+                       Diet=dataset@colData$Diet)
+  
+  MDS_plotter <- function(assay_data,colored_by){
+    df1 <- na.omit(assay_data)
+    graph1 <- ggplot(df1, aes_string(x="Dim1", y="Dim2", color=colored_by, text = "Animal_ID")) + geom_point(size=3)
+    graph2 <- ggplot(df1, aes_string(x="Dim1", y="Dim3", color=colored_by, text = "Animal_ID")) + geom_point(size=3) 
+    graph3 <- ggplot(df1, aes_string(x="Dim2", y="Dim3", color=colored_by, text = "Animal_ID")) + geom_point(size=3) 
+    return(graph1+graph2+graph3+plot_layout(guides = 'collect'))}
+
+  graph <- MDS_plotter(mds_df,"Diet")
+
+  return(graph)}
+
+mds_function(imputed_sumExp_4_weeks)
+```
+
+Several outliers identified on MDS, which correspond with samples that had contamination from muscle therefore they are excluded from the dataset
+
+```{r exclude_muscle_contam}
+outliers_4_week <- c("20842","21167","20833","20821","21182")
+
+imputed_sumExp_4_weeks_no_outliers <- imputed_sumExp_4_weeks[,!colnames(imputed_sumExp_4_weeks) %in% outliers_4_week]
+
+mds_function(imputed_sumExp_4_weeks_no_outliers)
+```
+
+Making a tidy table for plotting in ggplot
+
+```{r tidy_table}
+Meta_tidy_4_weeks <- as.data.frame(imputed_sumExp_4_weeks_no_outliers@colData) %>% rownames_to_column(var = "Animal_ID")
+
+protein_tibble_4_weeks <- as_tibble(assay(imputed_sumExp_4_weeks_no_outliers), rownames = "proteins") %>% full_join(protein_table_4_weeks[,1:3],by="proteins")
+tidy_protein_table_4_weeks <- pivot_longer(protein_tibble_4_weeks,cols= -c(proteins,Gene.names,unique.gene.name),names_to = "Animal_ID",values_to = "LogIntensity")
+tidy_protein_table_4_weeks <- inner_join(Meta_tidy_4_weeks,tidy_protein_table_4_weeks,by="Animal_ID")
+tidy_protein_table_4_weeks$Diet <- factor(tidy_protein_table_4_weeks$Diet, levels = c("chow","starch","fat"))
+```
+
+### Statistical analysis of 4 week-fed mice
+
+Limma analysis for continuous variables, lipogenesis and triglyceride content (4 weeks only) 
+
+```{r limma_continuous}
+limma_continuous_phenotype  <- function(phenotype){
+  
+  pheno_meta <- as_tibble(imputed_sumExp_4_weeks_no_outliers@colData,rownames = "Animal_ID") %>% drop_na(phenotype) %>% filter(phenotype > 0) 
+  
+  pheno_m <- assay(imputed_sumExp_4_weeks_no_outliers)[,pheno_meta$Animal_ID]
+  
+  pheno <- log2(pull(pheno_meta, phenotype))
+  pheno_diet <- factor(pheno_meta$Diet)
+  pheno_cohort <- factor(pheno_meta$Cohort)
+  
+  pheno_model <- model.matrix(~pheno)
+  
+  is.fullrank(pheno_model)
+  
+  fit_pheno <- lmFit(pheno_m, pheno_model)
+  fitCont_pheno <- eBayes(fit_pheno,trend = T,robust = T)
+  plotSA(fitCont_pheno)
+  
+  pheno_res <- topTable(fitCont_pheno, coef = 2, number = Inf, sort.by = "none")
+  
+  pheno_res <- left_join(rownames_to_column(pheno_res,var="proteins"),protein_table_4_weeks[,1:3],by="proteins")
+  
+  return(pheno_res)}
+
+lipo_res <- limma_continuous_phenotype("liver_lipogenesis")
+
+count(lipo_res$adj.P.Val<0.05&lipo_res$logFC>0)
+count(lipo_res$adj.P.Val<0.05&lipo_res$logFC<0)
+
+lipo_res_positive <- filter(lipo_res,logFC>0 & adj.P.Val < 0.05)
+
+trig_res <- limma_continuous_phenotype("liver_triglyceride_content")
+
+trig_res_positive <- filter(trig_res,logFC>0 & adj.P.Val < 0.05)
+
+count(trig_res$adj.P.Val<0.05&trig_res$logFC>0)
+count(trig_res$adj.P.Val<0.05&trig_res$logFC<0)
+```
+
+Volcano plots for the continuous measurements 
+
+```{r volcano_continuous}
+volcanoplotter_pheno <- function(results_table,x_limits,label_n,gradient_limits){
+  
+  top_genes <- slice_min(results_table,order_by = P.Value, n =label_n)
+  rt <- mutate(results_table, Stat_Sig = ifelse(adj.P.Val < 0.05,T,F)) %>% mutate(plot = ifelse(proteins %in% top_genes$proteins,T,F))
+  
+  
+  graph <- ggplot(rt, aes(x=logFC, y=-log10(P.Value),text=Gene.names))+geom_point(aes(color=logFC,alpha=Stat_Sig))+ geom_text_repel( 
+    data=rt %>% filter(plot==T),
+    aes(label=unique.gene.name),show.legend = F,color="black",position = position_nudge(y = 0.2))+
+    scale_x_continuous(limits=x_limits)+
+    scale_color_gradientn(colours=c("blue","grey","red"),limits = gradient_limits)+
+    theme_classic()+theme(panel.border = element_rect(colour = "black", fill=NA, linewidth=1.5))+
+    scale_alpha_manual(values=c(0.1,1))
+  
+  return(graph)}
+
+VP1 <- volcanoplotter_pheno(lipo_res,c(-1.6,1.6),44,c(-1.6,1.6))
+
+VP2 <- volcanoplotter_pheno(trig_res,c(-1,1),45,c(-1,1))
+
+VP1
+
+VP2
+```
+
+Pathway analysis (Gene over representation analysis using clusterprofiler)
+
+```{r GO_continuous}
+GO_function <- function(results_sheet,GO_type,direction, adj_p_val_cutoff){
+  
+  upregulated_proteins <- filter(results_sheet, adj.P.Val < adj_p_val_cutoff & logFC > 0) %>% filter(unique.gene.name != "")
+  
+  upregulated_proteins =  bitr(upregulated_proteins$unique.gene.name, fromType = "SYMBOL",
+                  toType = c("ENSEMBL", "ENTREZID"),
+                  OrgDb = org.Mm.eg.db)
+  
+  downregulated_proteins <- filter(results_sheet, adj.P.Val < adj_p_val_cutoff & logFC < 0) %>% filter(unique.gene.name != "")
+  
+  downregulated_proteins =  bitr(downregulated_proteins$unique.gene.name, fromType = "SYMBOL",
+                               toType = c("ENSEMBL", "ENTREZID"),
+                               OrgDb = org.Mm.eg.db)
+  
+  background = bitr(lipo_res$unique.gene.name, fromType = "SYMBOL",
+                    toType = c("ENSEMBL", "ENTREZID"),
+                    OrgDb = org.Mm.eg.db)
+  
+  if(direction == "up"){dat = upregulated_proteins}
+  else if(direction == "down"){dat = downregulated_proteins}
+  
+  GO <- enrichGO(gene = dat$ENTREZID,OrgDb = org.Mm.eg.db,ont = GO_type,universe = background$ENTREZID,readable = T,keyType = "ENTREZID")
+  GO <- simplify(GO,cutoff=0.7)
+  
+  return(GO)}
+
+upregulated_lipo_GO <- GO_function(lipo_res,"BP","up",0.01)
+
+downregulated_lipo_GO <- GO_function(lipo_res,"BP","down",0.01)
+
+clusterProfiler::dotplot(upregulated_lipo_GO)
+
+upregulated_trig_GO <- GO_function(trig_res,"BP","up",0.01)
+
+downregulated_trig_GO <- GO_function(trig_res,"BP","down",0.01)
+
+clusterProfiler::dotplot(upregulated_trig_GO)
+```
+
+Plots of linear regression of protein abundance vs continuous phenotype
+
+```{r protein_correlation_graphs}
+lr_protein_name <- function(protein_names,pheno,ncols,line){
+  dat <- rename(tidy_protein_table_4_weeks, "pheno" = pheno)
+  graph <- filter(dat, proteins %in% protein_names) %>% ggplot(aes(x = log2(pheno), y = LogIntensity)) +
+    geom_smooth(color="black",method="lm",linetype = line) +
+    geom_point(aes(color=Diet),alpha=0.7) +
+    facet_wrap(~unique.gene.name, scales ="free_y",ncol=ncols)+
+    scale_color_manual(values=diet_colors)+
+    scale_x_continuous(breaks = c(3,4,5))+
+    xlab("Log Lipogenesis")+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          panel.border = element_rect(colour = "black", fill=NA, size=1))
+  return(graph)}
+
+top_5_lipo_positive <- slice_min(filter(lipo_res,logFC>0),order_by = P.Value,n = 5)
+top_5_lipo_negative <- slice_min(filter(lipo_res,logFC<0),order_by = P.Value,n = 5)
+
+lr_protein_name(top_5_lipo_positive$proteins,"liver_lipogenesis",5,"solid")/
+lr_protein_name(top_5_lipo_negative$proteins,"liver_lipogenesis",5,"solid")
+
+top_3_trig_positive <- slice_min(filter(trig_res,logFC>0),order_by = P.Value,n = 3)
+top_3_lipo_positive <- slice_min(filter(lipo_res,logFC>0),order_by = P.Value,n = 3)
+
+lr_protein_name(top_3_trig_positive$proteins,"liver_triglyceride_content",3,"solid")/
+lr_protein_name(top_3_lipo_positive$proteins,"liver_triglyceride_content",3,"blank")
+```
+
+Limma comparing different diets
+
+```{r limma_diet}
+limma_diets <- function(exp_obj){
+diet <- factor(exp_obj@colData$Diet)
+
+model <- model.matrix(~0+diet)
+
+is.fullrank(model)
+
+head(model)
+
+contrasts <- makeContrasts(fat_v_chow = (dietfat - dietchow)
+                           , starch_v_chow = (dietstarch - dietchow)
+                           , fat_v_starch = (dietfat - dietstarch)
+                           ,levels = model)
+
+fit <- lmFit(assay(exp_obj), model)
+plotSA(fit)
+
+diet_res <- lapply(colnames(contrasts), function(cont){
+  
+  fitCont <- contrasts.fit(fit, contrasts = contrasts[,cont])
+  fitCont <- eBayes(fitCont,trend = T,robust = T)
+  plotSA(fitCont)
+  dat <- topTable(fitCont, number = Inf, sort.by = "none") 
+  left_join(rownames_to_column(dat,var="proteins"),protein_table_4_weeks[,1:3],by="proteins")
+})
+
+names(diet_res) <- colnames(contrasts)
+
+return(diet_res)}
+
+diet_res <- limma_diets(imputed_sumExp_4_weeks_no_outliers)
+
+hist(diet_res$fat_v_chow$P.Value)
+count(diet_res$fat_v_chow$adj.P.Val < 0.05)
+count(diet_res$fat_v_chow$adj.P.Val < 0.05 & diet_res$fat_v_chow$logFC>0)
+count(diet_res$fat_v_chow$adj.P.Val < 0.05 & diet_res$fat_v_chow$logFC<0)
+
+hist(diet_res$starch_v_chow$P.Value)
+count(diet_res$starch_v_chow$adj.P.Val < 0.05 & diet_res$starch_v_chow$logFC>0)
+count(diet_res$starch_v_chow$adj.P.Val < 0.05 & diet_res$starch_v_chow$logFC<0)
+
+
+hist(diet_res$fat_v_starch$P.Value)
+count(diet_res$fat_v_starch$adj.P.Val < 0.05 & diet_res$fat_v_starch$logFC>0)
+count(diet_res$fat_v_starch$adj.P.Val < 0.05 & diet_res$fat_v_starch$logFC<0)
+```
+
+Limma diets corrected for triglyceride content (to look at the chow specific proteome)
+
+```{r limma_diet_corrected_for_trig}
+limma_diet_corrected <- function(exp_obj){
+
+meta <- as_tibble(exp_obj@colData,rownames = "Animal_ID") %>% drop_na(liver_lipogenesis) %>% filter(liver_lipogenesis > 0) 
+exp <- exp_obj[,meta$Animal_ID]
+
+diet <- factor(exp@colData$Diet)
+trig <- exp$liver_triglyceride_content
+
+#lipo <- exp$liver_lipogenesis
+
+model <- model.matrix(~0+diet+trig)
+
+is.fullrank(model)
+
+head(model)
+
+contrasts <- makeContrasts(fat_v_chow = (dietfat - dietchow)
+                           , starch_v_chow = (dietstarch - dietchow)
+                           , fat_v_starch = (dietfat - dietstarch)
+                           , starch_and_fat_v_chow = ((dietfat + dietstarch)/2-dietchow)
+                           ,levels = model)
+
+fit <- lmFit(assay(exp), model)
+plotSA(fit)
+
+diet_res <- lapply(colnames(contrasts), function(cont){
+  
+  fitCont <- contrasts.fit(fit, contrasts = contrasts[,cont])
+  fitCont <- eBayes(fitCont,trend = T,robust = T)
+  plotSA(fitCont)
+  dat <- topTable(fitCont, number = Inf, sort.by = "none") 
+  left_join(rownames_to_column(dat,var="proteins"),protein_table_4_weeks[,1:3],by="proteins")
+})
+
+names(diet_res) <- colnames(contrasts)
+
+return(diet_res)}
+
+diet_res_corrected <- limma_diet_corrected(imputed_sumExp_4_weeks_no_outliers)
+
+hist(diet_res_corrected$starch_and_fat_v_chow$P.Value)
+count(diet_res_corrected$starch_and_fat_v_chow$adj.P.Val < 0.05)
+```
+
+Volcano plots between diets
+
+```{r volcano_diets}
+volcanoplotter <- function(results_table,x_limits,colors,n_proteins){
+  
+  res <- results_table
+  
+  top_genes <- slice_min(res,order_by = P.Value, n =n_proteins)
+  rt <- mutate(res, Stat_Sig = ifelse(adj.P.Val < 0.01,T,F)) %>% mutate(plot = ifelse(proteins %in% top_genes$proteins,T,F))  %>% 
+  mutate(direction = ifelse(logFC > 0,"up","down"))
+  
+  graph <- ggplot(rt, aes(x=logFC, y=-log10(P.Value), color=direction, text=unique.gene.name))+geom_point(aes(alpha=Stat_Sig))+ geom_text_repel( 
+    data=rt %>% filter(plot==T),
+    aes(label=unique.gene.name),show.legend = F,color="black",position = position_nudge(y = 0.2))+
+    scale_x_continuous(limits=x_limits)+
+    theme_classic()+theme(panel.border = element_rect(colour = "black", fill=NA, linewidth=1.5))+
+    scale_color_manual(values = colors)+
+    scale_alpha_manual(values=c(0.1,1))
+  
+  return(graph)}
+
+V_FvC <- volcanoplotter(diet_res$fat_v_chow,c(-3,3),c(diet_colors[1],diet_colors[3]),100)
+V_SvC <- volcanoplotter(diet_res$starch_v_chow,c(-3,3),c(diet_colors[1],diet_colors[2]),100)
+V_FvS <- volcanoplotter(diet_res$fat_v_starch,c(-3,3),c(diet_colors[2],diet_colors[3]),100)
+
+V_FvC/V_SvC/V_FvS
+```
+
+Venn diagram of triglyceride corrected data
+
+```{r Venn}
+sig_lists <- list(fat_v_chow = filter(diet_res_corrected$fat_v_chow,adj.P.Val<0.05)[,1], starch_v_chow = filter(diet_res_corrected$starch_v_chow,adj.P.Val<0.05)[,1], fat_v_starch = filter(diet_res_corrected$fat_v_starch,adj.P.Val<0.05)[,1])
+
+chow_proteins <- intersect(sig_lists$fat_v_chow,sig_lists$starch_v_chow)
+
+ggVennDiagram(sig_lists,label_alpha = 0)
+
+chow_proteins <- setdiff(intersect(sig_lists$fat_v_chow,sig_lists$starch_v_chow),sig_lists$fat_v_starch)
+chow_proteins <- filter(diet_res_corrected$starch_and_fat_v_chow,proteins %in% chow_proteins)
+
+#Venn diagram of lipo proteins vs trig proteins 
+
+lipo_vs_trig_proteins  <- intersect(lipo_res_positive$proteins,trig_res_positive$proteins)
+```
+
+GO analysis of chow specific proteins 
+
+```{r GO_chow}
+GO_function_chow <- function(results_sheet,GO_type){
+  
+  res <- filter(results_sheet, logFC<0)
+  
+  proteins =  bitr(res$unique.gene.name, fromType = "SYMBOL",
+                               toType = c("ENSEMBL", "ENTREZID"),
+                               OrgDb = org.Mm.eg.db)
+  
+  background = bitr(diet_res_corrected$starch_and_fat_v_chow$unique.gene.name, fromType = "SYMBOL",
+                    toType = c("ENSEMBL", "ENTREZID"),
+                    OrgDb = org.Mm.eg.db)
+  
+  GO <- enrichGO(gene = proteins$ENTREZID,OrgDb = org.Mm.eg.db,ont = GO_type,universe = background$ENTREZID,readable = T,keyType = "ENTREZID")
+  GO <- simplify(GO,0.5)
+  return(GO)}
+
+chow_GSE <- GO_function_chow(chow_proteins,"BP")
+
+chow_GSE@result %>% mutate(Description = fct_reorder(Description, -pvalue))%>% ggplot(aes(x=-log10(p.adjust),y=Description,fill=Count),color="black")+geom_col()+theme_classic()
+```
+
+Gene Set Enrichment Analysis for diets
+
+```{r GSE}
+GSE_function <- function(results_table,GO_type){
+  
+  gene.df =  bitr(results_table$unique.gene.name, fromType = "SYMBOL",
+                  toType = c("ENSEMBL", "ENTREZID"),
+                  OrgDb = org.Mm.eg.db)
+  
+  gene.df <- distinct(gene.df,SYMBOL,.keep_all = T)
+  
+
+  gene.df <- inner_join(gene.df,results_table,by = c("SYMBOL"="unique.gene.name")) %>% mutate("rank_metric"=-log10(P.Value)*sign(logFC))
+  
+  geneList = gene.df[,"rank_metric"]
+  names(geneList)= gene.df$ENSEMBL
+  geneList = sort(geneList, decreasing = TRUE)
+  
+  GSE_BP <- gseGO(geneList     = geneList,
+                  OrgDb        = org.Mm.eg.db,
+                  ont          = GO_type,
+                  minGSSize    = 100,
+                  maxGSSize    = 500,
+                  pvalueCutoff = 0.05,
+                  verbose      = FALSE,
+                  keyType = "ENSEMBL")
+  
+  GSE_BP <- setReadable(GSE_BP,OrgDb = org.Mm.eg.db,keyType = "ENSEMBL")
+  
+  GSE_BP <- simplify(GSE_BP)
+  
+  return(GSE_BP)}
+
+GSE_FvC <- GSE_function(diet_res$fat_v_chow,"BP")
+GSE_SvC <- GSE_function(diet_res$starch_v_chow,"BP")
+GSE_FvS <- GSE_function(diet_res$fat_v_starch,"BP")
+
+GSE_barplot_function <- function(sheet,colors){
+  graph <- slice_min(data.frame(sheet),order_by = pvalue,n=8) %>% mutate(Description = fct_reorder(Description, -pvalue)) %>% mutate(Direction = if_else(enrichmentScore>0,"Positive","Negative")) %>% 
+  ggplot(aes(x=-log10(p.adjust),fill=Direction,y=Description))+geom_col()+scale_fill_manual(values = colors)+theme_classic()+scale_y_discrete(position="right")+theme(axis.line.y =element_blank())
+  return(graph)
+}
+
+GSE_barplot_function(GSE_FvC,c(diet_colors[1],diet_colors[3]))/GSE_barplot_function(GSE_SvC,c(diet_colors[1],diet_colors[2]))/GSE_barplot_function(GSE_FvS,c(diet_colors[2],diet_colors[3]))
+```
+
+Heatmap for chow specific proteins
+
+```{r heatmap}
+chow_matrix <- imputed_sumExp_4_weeks_no_outliers[chow_proteins$proteins,]
+library(pheatmap)
+
+chow_proteins <- mutate(chow_proteins,direction = if_else(logFC>0,"up","down"))
+
+heatmap_function <- function(sumexpobj){
+
+col_annotations_df <- data.frame(diet = sumexpobj$Diet)
+rownames(col_annotations_df) <- colnames(assay(sumexpobj))
+col_annotations_df <- arrange(col_annotations_df,by=diet)
+matrix <- sumexpobj[,rownames(col_annotations_df)]
+row_annotations_df <- data.frame(unique.gene.name = matrix@elementMetadata$unique.gene.name, proteins = matrix@elementMetadata$proteins) %>%  
+left_join(chow_proteins[,c("proteins","direction")],by="proteins") %>% 
+column_to_rownames(var="proteins")
+row_annotations_df <- arrange(row_annotations_df,direction,unique.gene.name)
+matrix <- matrix[rownames(row_annotations_df),]
+row_names <- row_annotations_df$unique.gene.name
+row_annotations_df <- select(row_annotations_df,-unique.gene.name)
+
+colors = list(diet = c(chow = diet_colors[1],starch = diet_colors[2], fat = diet_colors[3]), direction = c(up = "#DBCDF0",down = "#FAEDCB"))
+
+graph <- pheatmap(mat = assay(matrix),
+                  scale = "row",
+                  annotation_col = col_annotations_df,
+                  cluster_cols = F,
+                  breaks= seq(-2, 2, 0.1),
+                  gaps_col = (c(13,27)),
+                  gaps_row = c(89),
+                  color = colorRampPalette(c("blue", "white", "red"))(40),
+                  labels_row = row_names,
+                  cluster_rows = F,
+                  show_colnames = F,
+                  treeheight_row = 0,
+                  fontsize_row = 6,
+                  annotation_row = row_annotations_df,
+                  annotation_colors = colors,
+                  border_color = "grey")
+
+return(graph)}
+
+heatmap_function(chow_matrix)
+```
+
+# Analsyis of 4-week-fed and 30-week-fed together
+
+Filter missing values and determine samples missing at random (MAR) and not missing at random
+ 
+```{r filtering_4+30}
+ missing_tidy <- as_tibble(assay(sumExp), rownames = "proteins") %>% pivot_longer(cols=-"proteins",names_to = "Animal_ID",values_to = "LogIntensity") %>% inner_join(lipogenesis_metadata,by="Animal_ID")
+
+Missing_table_subgroup <- missing_tidy %>% 
+   dplyr::group_by(sub_group,proteins) %>% 
+   summarise(sum_not_na = sum(!is.na(LogIntensity))) %>% 
+   pivot_wider(names_from = sub_group,values_from = sum_not_na)
+ 
+Missing_table <- Missing_table_subgroup %>% mutate(Keep=if_else(chow_four_weeks >= 8 & chow_thirty_weeks >= 6 & fat_four_weeks >= 8 & fat_thirty_weeks >= 6 & starch_four_weeks >= 8 & starch_thirty_weeks >= 6,"YES","NO"))
+ 
+ table(Missing_table$Keep)
+ 
+ protein_table <- full_join(rownames_to_column(protein_info,"proteins"),Missing_table,by = "proteins")
+ 
+ filtered_sumExp <- SummarizedExperiment(assays= assay(sumExp), colData=sumExp@colData, rowData=protein_table)
+ 
+ filtered_sumExp <- filtered_sumExp[filtered_sumExp@elementMetadata$Keep == "YES",]
+ 
+ boxplot(assay(filtered_sumExp))
+```
+ 
+Normalisation
+ 
+```{r normalisation_4+30}
+ filtered_sumExp <- QFeatures::normalize(filtered_sumExp,method="diff.median")
+ 
+ boxplot(assay(filtered_sumExp))
+```
+
+```{r mds_4+30}
+ mds_function <- function(exp_obj){
+   
+   m <-  assay(exp_obj)
+   
+   exp <- exp_obj
+   
+   mds <- plotMDS(m, plot = FALSE,top = 1000)
+   
+   mds_df <- data.frame(Animal_ID = colnames(mds$distance.matrix.squared),X = mds$x, Y = mds$y,Dim1 = mds$eigen.vectors[,1], Dim2 = mds$eigen.vectors[,2], Dim3 = mds$eigen.vectors[,3],
+                        Diet=exp@colData$Diet, timepoint = exp@colData$time_on_diet)
+   
+   MDS_plotter <- function(assay_data,colored_by){
+     df1 <- na.omit(assay_data)
+     graph1 <- ggplot(df1, aes_string(x="Dim1", y="Dim2", color=colored_by, text = "Animal_ID")) + geom_point(size=3)
+     graph2 <- ggplot(df1, aes_string(x="Dim1", y="Dim3", color=colored_by, text = "Animal_ID")) + geom_point(size=3) 
+     graph3 <- ggplot(df1, aes_string(x="Dim2", y="Dim3", color=colored_by, text = "Animal_ID")) + geom_point(size=3) 
+     return(graph1+graph2+graph3+plot_layout(guides = 'collect'))}
+   
+   MDS1 <- MDS_plotter(mds_df,"Diet")
+   MDS2 <- MDS_plotter(mds_df,"timepoint")
+   
+   graphs <- MDS1/MDS2
+   
+   return(graphs)}
+ 
+ mds_function(filtered_sumExp)
+```
+ 
+Outliers on MDS (208321 is an outlier for lipogenesis measurement)
+
+```{r remove_outliers_4+30}
+outliers_4_week <- c("20842","21167","20833","20821","21182","20831")
+ 
+filtered_sumExp_no_outliers <- filtered_sumExp[,!colnames(filtered_sumExp) %in% outliers_4_week]
+ 
+mds_function(filtered_sumExp_no_outliers)
+``` 
+ 
+Making a tidy table
+
+```{r tidy_table_4+30}
+Meta_tidy <- as.data.frame(filtered_sumExp_no_outliers@colData) %>% rownames_to_column(var = "Animal_ID")
+ 
+ protein_tibble <- as_tibble(assay(filtered_sumExp_no_outliers), rownames = "proteins") %>% left_join(protein_table[,1:3],by="proteins")
+ tidy_protein_table <- pivot_longer(protein_tibble,cols= -c(proteins,Gene.names,unique.gene.name),names_to = "Animal_ID",values_to = "LogIntensity")
+ tidy_protein_table <- inner_join(Meta_tidy,tidy_protein_table,by="Animal_ID")
+ tidy_protein_table$Diet <- factor(tidy_protein_table$Diet, levels = c("chow","starch","fat"))
+ tidy_protein_table$time_on_diet <- factor(tidy_protein_table$time_on_diet, levels = c("four_weeks","thirty_weeks"))
+```
+
+limma testing for the interaction between time and diet and diet
+ 
+```{r limma_4+30}
+ limma_time_diet_int <- function(exp_obj){
+   
+ diet <- factor(exp_obj@colData$Diet)
+ timepoint <- factor(exp_obj@colData$time_on_diet)
+ group <- factor(exp_obj@colData$sub_group)
+ 
+ model <- model.matrix(~0+group)
+ 
+ is.fullrank(model)
+ 
+ head(model)
+ 
+ colnames(model) <- sub(pattern = "group",replacement = "",x = colnames(model))
+ 
+ contrasts <- makeContrasts(fat_v_chow_v_time = ((fat_four_weeks - chow_four_weeks)-(fat_thirty_weeks - chow_thirty_weeks)),
+                            starch_v_chow_v_time = ((starch_four_weeks - chow_four_weeks)-(starch_thirty_weeks - chow_thirty_weeks)),
+                            fat_v_starch_v_time = ((fat_four_weeks - starch_four_weeks)-(fat_thirty_weeks - starch_thirty_weeks)),
+                            fat_v_chow_4_weeks = fat_four_weeks-chow_four_weeks,
+                            starch_v_chow_4_weeks = starch_four_weeks-chow_four_weeks,
+                            fat_v_starch_4_weeks = fat_four_weeks - starch_four_weeks,
+                            fat_v_chow_30_weeks = fat_thirty_weeks-chow_thirty_weeks,
+                            starch_v_chow_30_weeks = starch_thirty_weeks-chow_thirty_weeks,
+                            fat_v_starch_30_weeks = fat_thirty_weeks - starch_thirty_weeks,
+                            age_effect = ((chow_thirty_weeks+fat_thirty_weeks+starch_thirty_weeks)/3 - (chow_four_weeks+fat_four_weeks+starch_four_weeks)/3)
+                            ,levels = model)
+ 
+ fit <- lmFit(assay(exp_obj), model)
+ plotSA(fit)
+ 
+ diet_res <- lapply(colnames(contrasts), function(cont){
+   
+   fitCont <- contrasts.fit(fit, contrasts = contrasts[,cont])
+   fitCont <- eBayes(fitCont,trend = T,robust = T)
+   plotSA(fitCont)
+   dat <- topTable(fitCont, number = Inf, sort.by = "none") 
+   left_join(rownames_to_column(dat,var="proteins"),protein_table[,1:3],by="proteins")
+ })
+ 
+ names(diet_res) <- colnames(contrasts)
+ 
+ return(diet_res)}
+ 
+ diet_time_int_res <- limma_time_diet_int(filtered_sumExp_no_outliers)
+ 
+ hist(diet_time_int_res$fat_v_chow_v_time$P.Value)
+ count(diet_time_int_res$fat_v_chow_v_time$adj.P.Val < 0.05,na.rm = T)
+ 
+ hist(diet_time_int_res$starch_v_chow_v_time$P.Value)
+ count(diet_time_int_res$starch_v_chow_v_time$adj.P.Val < 0.05,na.rm = T)
+ 
+ hist(diet_time_int_res$fat_v_starch_v_time$P.Value)
+ count(diet_time_int_res$fat_v_starch_v_time$adj.P.Val < 0.05,na.rm = T)
+ 
+ hist(diet_time_int_res$age_effect$P.Value)
+ count(diet_time_int_res$age_effect$adj.P.Val < 0.05,na.rm = T)
+```
+
+Plotting the interactions between time on diet and diet 
+
+```{r int_plot_4+30}
+ 
+interaction_plot <- function(sheet_4_w,sheet_30_w,int_sheet){
+   merged_sheet <-  inner_join(sheet_4_w,sheet_30_w, by = "proteins") %>% inner_join(int_sheet[,c(1,5,6)])
+   colnames(merged_sheet) <- gsub(".x","_4_weeks",colnames(merged_sheet))
+   colnames(merged_sheet) <- gsub(".y","_30_weeks",colnames(merged_sheet))
+   rt <- merged_sheet  %>% mutate(sig = if_else(adj.P.Val < 0.05,"Sig","Non_Sig")) %>% filter(adj.P.Val_4_weeks<0.05 | adj.P.Val_30_weeks < 0.05) 
+    graph <-  ggplot(rt,aes(x=logFC_4_weeks,y=logFC_30_weeks,text=unique.gene.name_4_weeks,color=sig,alpha=sig))+geom_point()+geom_abline(intercept=0, slope=1)+
+     geom_text_repel( 
+       data=rt %>% filter(sig == "Sig"),
+       aes(label=unique.gene.name_4_weeks),show.legend = F,color="red",position = position_nudge(y = 0.2))+
+      scale_color_manual(values = c("black","red"))+
+      theme(panel.background = element_blank(),panel.border = element_rect(colour = "black", fill=NA, linewidth=1.5))+
+    scale_x_continuous(limits=c(-3,3))+
+    scale_y_continuous(limits=c(-3,3))+
+    annotate(geom = "text",x = -2,y = 2,label = paste("R = ",round(cor(rt$logFC_4_weeks,rt$logFC_30_weeks),digits = 2),"\n N =", length(rt$proteins),sep = ""))
+   return(graph)
+ }
+ 
+fat_chow_int_plot <- interaction_plot(diet_time_int_res$fat_v_chow_4_weeks,diet_time_int_res$fat_v_chow_30_weeks,diet_time_int_res$fat_v_chow_v_time)
+starch_chow_int_plot <- interaction_plot(diet_time_int_res$starch_v_chow_4_weeks,diet_time_int_res$starch_v_chow_30_weeks,diet_time_int_res$starch_v_chow_v_time)
+fat_starch_int_plot <- interaction_plot(diet_time_int_res$fat_v_starch_4_weeks,diet_time_int_res$fat_v_starch_30_weeks,diet_time_int_res$fat_v_starch_v_time)
+
+fat_chow_int_plot/starch_chow_int_plot/fat_starch_int_plot
+```
+
+Boxplot of sig diet x time int
+
+```{r boxplot_4+30}
+boxplot_gene_name <- function(Gene_names,ncols){
+  tidy_protein_table$time_on_diet <- factor(tidy_protein_table$time_on_diet)
+  graph <- filter(tidy_protein_table, unique.gene.name %in% Gene_names) %>% ggplot(aes(x = time_on_diet , y = LogIntensity, fill = Diet)) +
+    geom_boxplot(color = "black",alpha=0.5) +
+    geom_point(aes(color=Diet,x=time_on_diet),position = position_dodge(width=0.75)) + facet_wrap(~unique.gene.name, scales ="free_y",ncol = ncols)+
+    scale_fill_manual(values=diet_colors) +
+    scale_color_manual(values=diet_colors) +
+    scale_x_discrete(labels=c("four_weeks" = "4", "thirty_weeks" = "30")) +
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          panel.border = element_rect(colour = "black", fill=NA, size=1))
+  
+  return(graph)}
+
+diet_time_int <- c("Scpep1","Amacr","Trip12","Gstp1","Cyp4a12b","Gstm2","Cyp4a10")
+
+boxplot_gene_name(diet_time_int,2)
+```
+
+Making a z scored data frame to plot averages between protein groups
+
+```{r protein_summary_4+30}
+z_scored_m <- t(scale(t(assay(filtered_sumExp_no_outliers))))
+
+z_tidy <- as.data.frame(filtered_sumExp_no_outliers@colData) %>% rownames_to_column(var = "Animal_ID")
+
+z_tibble <- as_tibble(z_scored_m, rownames = "proteins") %>% left_join(protein_table[,1:3],by="proteins")
+tidy_z <- pivot_longer(z_tibble,cols= -c(proteins,Gene.names,unique.gene.name),names_to = "Animal_ID",values_to = "LogIntensity")
+tidy_z <- inner_join(z_tidy,tidy_z,by="Animal_ID")
+tidy_z$Diet <- factor(tidy_z$Diet, levels = c("chow","starch","fat"))
+tidy_z$time_on_diet <- factor(tidy_z$time_on_diet, levels = c("four_weeks","thirty_weeks"))
+
+summary_z <- summarySE(tidy_z, measurevar="LogIntensity", groupvars=c("Animal_ID","Diet","time_on_diet"),na.rm = T)
+
+# Plotting protein summaries
+
+Summary_box_plotter <- function(protein_filter_sheet){
+
+  
+graph <- tidy_z %>% filter(proteins %in% protein_filter_sheet$proteins) %>% 
+  summarySE(measurevar="LogIntensity", groupvars=c("Animal_ID","Diet","time_on_diet"),na.rm = T) %>% 
+ggplot(aes(x=time_on_diet,y=LogIntensity,fill=Diet)) + 
+  geom_boxplot(color = "black",alpha=0.5) +
+  geom_point(aes(color=Diet,x=time_on_diet),position = position_dodge(width=0.75)) +
+  scale_fill_manual(values = diet_colors) +
+  scale_color_manual(values = diet_colors) +
+  scale_y_continuous(limits = c(-1,1)) +
+  ylab(label = "LogIntensity (Mean Centered)") +
+  xlab("Weeks on Diet") +
+  scale_x_discrete(labels=c("four_weeks" = "4", "thirty_weeks" = "30")) +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+return(graph)}
+
+(Summary_box_plotter(lipo_res_positive)/Summary_box_plotter(trig_res_positive)/Summary_box_plotter(chow_proteins)/Summary_box_plotter(diet_time_int_res$fat_v_chow_v_time)) + plot_layout(guides = "collect")
+```
+
+2-way ANOVA stats for protein groups
+
+```{r 2-way ANOVA_4+30}
+protein_group_2_wayANOVA <- function(protein_filter_sheet){
+
+filt <- tidy_z %>% filter(proteins %in% protein_filter_sheet$proteins) %>% 
+summarySE(measurevar="LogIntensity", groupvars=c("Animal_ID","Diet","time_on_diet"),na.rm = T)
+
+filt$Diet <- factor(filt$Diet)
+filt$time_on_diet <- factor(filt$time_on_diet)
+
+res <- aov(LogIntensity ~ Diet * time_on_diet, data = filt)
+return(res)}
+
+lipo_res_ANOVA <- protein_group_2_wayANOVA(lipo_res_positive)
+summary(lipo_res_ANOVA)
+
+trig_res_ANOVA <- protein_group_2_wayANOVA(trig_res_positive)
+summary(trig_res_ANOVA)
+
+chow_proteins_res_ANOVA <- protein_group_2_wayANOVA(chow_proteins)
+summary(chow_proteins_res_ANOVA)
+
+all_proteins_res_ANOVA <- protein_group_2_wayANOVA(diet_time_int_res$fat_v_chow_v_time)
+summary(all_proteins_res_ANOVA)
+```
