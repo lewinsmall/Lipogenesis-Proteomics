@@ -19,7 +19,6 @@ library(tidyverse)
 library(QFeatures)
 library(limma)
 library(patchwork)
-library(readxl)
 library(clusterProfiler)
 library(org.Mm.eg.db)
 library(wesanderson)
@@ -49,7 +48,7 @@ Read in proteomics data and metadata
 
 ```{r read_in_data}
 proteinGroups <- read.delim("/Users/lsma0320/Documents/GitHub/Lipogenesis-Proteomics/proteinGroups.txt")
-lipogenesis_metadata <- read_excel("/Users/lsma0320/Documents/GitHub/Lipogenesis-Proteomics/lipogenesis_metadata.xlsx",sheet = 3)
+lipogenesis_metadata <- read_csv("/Users/lsma0320/Documents/GitHub/Lipogenesis-Proteomics/lipogenesis_metadata.csv")
 ```
 
 ### Data Wrangling
