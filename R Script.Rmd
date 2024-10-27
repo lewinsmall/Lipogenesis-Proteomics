@@ -216,6 +216,8 @@ Imputation, low values are imputed in for samples that are not MAR (MNAR) using 
 (Only 7 proteins are MNAR)
 
 ```{r imputation}
+table(filtered_sumExp_4_weeks@elementMetadata$MAR)
+
 imputed_sumExp_4_weeks <- QFeatures::impute(filtered_sumExp_4_weeks, method = "mixed",
                                        randna = filtered_sumExp_4_weeks@elementMetadata$MAR,
                                        mar = "none",
@@ -229,18 +231,14 @@ mds_function <- function(dataset){
   
   mds <- plotMDS(assay(dataset), plot = FALSE,top=500)
   
-  mds_df <- data.frame(Animal_ID = colnames(mds$distance.matrix.squared),X = mds$x, Y = mds$y,Dim1 = mds$eigen.vectors[,1], Dim2 = mds$eigen.vectors[,2], Dim3 = mds$eigen.vectors[,3],
+  mds_df <- data.frame(Animal_ID = colnames(mds$distance.matrix.squared),X = mds$x, Y = mds$y,
                        Diet=dataset@colData$Diet)
   
-  MDS_plotter <- function(assay_data,colored_by){
-    df1 <- na.omit(assay_data)
-    graph1 <- ggplot(df1, aes_string(x="Dim1", y="Dim2", color=colored_by, text = "Animal_ID")) + geom_point(size=3)
-    graph2 <- ggplot(df1, aes_string(x="Dim1", y="Dim3", color=colored_by, text = "Animal_ID")) + geom_point(size=3) 
-    graph3 <- ggplot(df1, aes_string(x="Dim2", y="Dim3", color=colored_by, text = "Animal_ID")) + geom_point(size=3) 
-    return(graph1+graph2+graph3+plot_layout(guides = 'collect'))}
-
-  graph <- MDS_plotter(mds_df,"Diet")
-
+ mds_df$Diet <- factor(mds_df$Diet,levels = c("chow","starch","fat"))
+    df1 <- na.omit(mds_df)
+    
+  graph <- ggplot(df1, aes(x=X, y=Y, fill=Diet, text = Animal_ID)) + geom_point(size=3,shape=21,color="black")+scale_fill_manual(values = diet_colors) + xlab("Dim 1") + ylab("Dim 2")+theme_classic()+theme(panel.border = element_rect(colour = "black", fill=NA, size=2))
+    
   return(graph)}
 
 mds_function(imputed_sumExp_4_weeks)
@@ -254,6 +252,9 @@ outliers_4_week <- c("20842","21167","20833","20821","21182")
 imputed_sumExp_4_weeks_no_outliers <- imputed_sumExp_4_weeks[,!colnames(imputed_sumExp_4_weeks) %in% outliers_4_week]
 
 mds_function(imputed_sumExp_4_weeks_no_outliers)
+
+MDS_graph_1 <- (mds_function(imputed_sumExp_4_weeks)|mds_function(imputed_sumExp_4_weeks_no_outliers))+plot_layout(guides = "collect")
+MDS_graph_1
 ```
 
 Making a tidy table for plotting in ggplot
@@ -473,8 +474,6 @@ exp <- exp_obj[,meta$Animal_ID]
 diet <- factor(exp@colData$Diet)
 trig <- exp$liver_triglyceride_content
 
-#lipo <- exp$liver_lipogenesis
-
 model <- model.matrix(~0+diet+trig)
 
 is.fullrank(model)
@@ -607,8 +606,6 @@ GSE_function <- function(results_table,GO_type){
   
   GSE_BP <- setReadable(GSE_BP,OrgDb = org.Mm.eg.db,keyType = "ENSEMBL")
   
-  GSE_BP <- simplify(GSE_BP)
-  
   return(GSE_BP)}
 
 GSE_FvC <- GSE_function(diet_res$fat_v_chow,"BP")
@@ -654,7 +651,7 @@ graph <- pheatmap(mat = assay(matrix),
                   cluster_cols = F,
                   breaks= seq(-2, 2, 0.1),
                   gaps_col = (c(13,27)),
-                  gaps_row = c(89),
+                  gaps_row = c(88),
                   color = colorRampPalette(c("blue", "white", "red"))(40),
                   labels_row = row_names,
                   cluster_rows = F,
@@ -715,21 +712,24 @@ Normalisation
    mds_df <- data.frame(Animal_ID = colnames(mds$distance.matrix.squared),X = mds$x, Y = mds$y,Dim1 = mds$eigen.vectors[,1], Dim2 = mds$eigen.vectors[,2], Dim3 = mds$eigen.vectors[,3],
                         Diet=exp@colData$Diet, timepoint = exp@colData$time_on_diet)
    
-   MDS_plotter <- function(assay_data,colored_by){
+   MDS_plotter <- function(assay_data,colored_by,color_scheme){
      df1 <- na.omit(assay_data)
-     graph1 <- ggplot(df1, aes_string(x="Dim1", y="Dim2", color=colored_by, text = "Animal_ID")) + geom_point(size=3)
-     graph2 <- ggplot(df1, aes_string(x="Dim1", y="Dim3", color=colored_by, text = "Animal_ID")) + geom_point(size=3) 
-     graph3 <- ggplot(df1, aes_string(x="Dim2", y="Dim3", color=colored_by, text = "Animal_ID")) + geom_point(size=3) 
+     graph1 <- ggplot(df1, aes(x=Dim1, y=Dim2, fill={{colored_by}}, text = Animal_ID)) + geom_point(size=3,shape=21,color="black")+scale_fill_manual(values = color_scheme) + xlab("Dim 1") + ylab("Dim 2")+theme_classic()+theme(panel.border = element_rect(colour = "black", fill=NA, size=2))
+     
+    graph2 <- ggplot(df1, aes(x=Dim1, y=Dim3, fill={{colored_by}}, text = Animal_ID)) + geom_point(size=3,shape=21,color="black")+scale_fill_manual(values = color_scheme) + xlab("Dim 1") + ylab("Dim 3")+theme_classic()+theme(panel.border = element_rect(colour = "black", fill=NA, size=2))
+    
+     graph3 <- ggplot(df1, aes(x=Dim2, y=Dim3, fill={{colored_by}}, text = Animal_ID)) + geom_point(size=3,shape=21,color="black")+scale_fill_manual(values = color_scheme) + xlab("Dim 2") + ylab("Dim 3")+theme_classic()+theme(panel.border = element_rect(colour = "black", fill=NA, size=2))
+     
      return(graph1+graph2+graph3+plot_layout(guides = 'collect'))}
    
-   MDS1 <- MDS_plotter(mds_df,"Diet")
-   MDS2 <- MDS_plotter(mds_df,"timepoint")
+   MDS1 <- MDS_plotter(mds_df,Diet,diet_colors)
+   MDS2 <- MDS_plotter(mds_df,timepoint,c("#F3D17C","#C4B7BB"))
    
    graphs <- MDS1/MDS2
    
    return(graphs)}
  
- mds_function(filtered_sumExp)
+mds_function(filtered_sumExp)
 ```
  
 Outliers on MDS (208321 is an outlier for lipogenesis measurement)
@@ -739,7 +739,8 @@ outliers_4_week <- c("20842","21167","20833","20821","21182","20831")
  
 filtered_sumExp_no_outliers <- filtered_sumExp[,!colnames(filtered_sumExp) %in% outliers_4_week]
  
-mds_function(filtered_sumExp_no_outliers)
+MDS_graph_2 <- mds_function(filtered_sumExp_no_outliers)
+MDS_graph_2
 ``` 
  
 Making a tidy table
